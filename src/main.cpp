@@ -31,8 +31,8 @@ int main() {
   
   // Constants for speed and acceleration control
   const double MAX_SPEED = 49.5; // mph, just under 50 mph limit
-  const double MAX_ACC = 0.224;  // Maximum acceleration increment (prevents jerk)
-  const double SAFE_DISTANCE = 30.0; // Safe distance to keep from vehicle ahead (meters)
+  const double MAX_ACC = 0.225;  // Maximum acceleration increment (prevents jerk)
+  const double SAFE_DISTANCE = 20.0; // Safe distance to keep from vehicle ahead (meters)
   
   // Lane change state
   bool changing_lanes = false;
@@ -206,7 +206,7 @@ int main() {
               // If car is approaching from behind at high speed, mark lane as unsafe
               // Check if it would reach us within 3 seconds
               double time_to_collision = distance_back / (check_speed > car_speed*0.447 ? (check_speed - car_speed*0.447) : 0.001);
-              if (distance_back < 15 || (distance_back < 50 && time_to_collision < 3.0)) {
+              if (distance_back < 10 || (distance_back < 50 && time_to_collision < 3.0)) {
                 lane_is_safe[check_car_lane] = false;
               }
             }
@@ -223,9 +223,11 @@ int main() {
             }
             
             // If extremely close to the front car, apply emergency braking
-            if (closest_front[lane] < 15) {
+            if (closest_front[lane] < 10) {
               // Apply heavier braking to avoid collision
               ref_vel -= MAX_ACC * 2;
+            }else if (closest_front[lane] < 5) {
+              ref_vel -= MAX_ACC * 5;
             }
             
             // Match speed with front car if we're getting close and can't change lanes
@@ -252,7 +254,7 @@ int main() {
               
               // If we've been patient enough, we might take a slightly riskier lane change
               // Only when we've been stuck behind slow traffic for a while
-              double safety_threshold = stuck_counter > PATIENCE_THRESHOLD ? 0.8 : 1.0;
+              double safety_threshold = stuck_counter > PATIENCE_THRESHOLD ? 0.4 : 1.0;
               
               // Check if adjacent lanes are safe for changing
               for (int l = 0; l < 3; l++) {
@@ -308,8 +310,12 @@ int main() {
             }
           } else if (ref_vel < MAX_SPEED) {
             // No vehicle close ahead, accelerate if below speed limit
-            ref_vel += MAX_ACC;
-            
+            // ref_vel += 2* MAX_ACC;
+            if(ref_vel < MAX_SPEED - 10){
+              ref_vel += 3* MAX_ACC;  
+            }else{
+              ref_vel += MAX_ACC;
+            }
             // Reset stuck counter since we're not stuck
             stuck_counter = 0;
             
@@ -381,6 +387,15 @@ int main() {
         
           // Create a spline
           tk::spline s;
+          
+          // Make sure x coordinates are strictly increasing (required by spline)
+          for (int i = 0; i < ptsx.size()-1; i++) {
+            if (ptsx[i] >= ptsx[i+1]) {
+              // Fix non-increasing point by adding a small increment
+              ptsx[i+1] = ptsx[i] + 0.01;
+            }
+          }
+          
           // Set (x,y) points to the spline (i.e. fits a spline to those points)
           s.set_points(ptsx, ptsy);
           
