@@ -28,7 +28,20 @@ int main() {
   int lane = 1;
   // Start at zero velocity and gradually accelerate
   double ref_vel = 0.0; // mph
-
+  
+  // Constants for speed and acceleration control
+  const double MAX_SPEED = 49.5; // mph, just under 50 mph limit
+  const double MAX_ACC = 0.224;  // Maximum acceleration increment (prevents jerk)
+  const double SAFE_DISTANCE = 30.0; // Safe distance to keep from vehicle ahead (meters)
+  
+  // Lane change state
+  bool changing_lanes = false;
+  int target_lane = 1;
+  
+  // Track how long we've been stuck behind someone
+  int stuck_counter = 0;
+  const int PATIENCE_THRESHOLD = 100; // Number of iterations before considering riskier maneuvers
+  
   // Waypoint map to read from
   string map_file_ = "../data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
@@ -57,7 +70,9 @@ int main() {
   }
 
   h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
-               &map_waypoints_dx,&map_waypoints_dy,&ref_vel,&lane]
+               &map_waypoints_dx,&map_waypoints_dy,&ref_vel,&lane,
+               &changing_lanes,&target_lane,&MAX_SPEED,&MAX_ACC,&SAFE_DISTANCE,&max_s,
+               &stuck_counter,&PATIENCE_THRESHOLD]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
@@ -103,32 +118,211 @@ int main() {
 
           int prev_size = previous_path_x.size();
           
+          // Update car_s to the end of the previous path
           if (prev_size > 0) {
             car_s = end_path_s;
           }
-        
-          bool too_close = false; // True if too close to a car in front
-        
-          // Find ref_v to use
-          for (int i = 0; i < sensor_fusion.size(); i++) {
-            // Check if the car is in the same lane as the ego vehicle
-            float d = sensor_fusion[i][6];
-            if (d < (2+4*lane+2) && d > (2+4*lane-2)){
-              double vx = sensor_fusion[i][3];
-              double vy = sensor_fusion[i][4];
-              double check_speed = sqrt(vx*vx + vy*vy);
-              double check_car_s = sensor_fusion[i][5];
-              
-              // Calculate the check_car's future location
-              check_car_s += (double)prev_size * 0.02 * check_speed;
-              // If the check_car is within 30 meters in front, reduce ref_vel so that we don't hit it
-              if (check_car_s > car_s && (check_car_s - car_s) < 30){
-                //ref_vel = 29.5;
-                too_close = true;
-              } 
+          
+          // Handle lane change in progress
+          if (changing_lanes && lane != target_lane) {
+            // Check if we're close to center of lane
+            if (fabs(car_d - (2 + 4*lane)) < 0.5) {
+              // We've completed the lane change
+              lane = target_lane;
+              changing_lanes = false;
             }
           }
         
+          // Flags for behavior
+          bool too_close = false;
+          vector<bool> lane_is_safe(3, true); // Assume all lanes are safe initially
+          
+          // Store closest vehicle ahead in each lane and its distance
+          vector<double> closest_front(3, 999999.0);
+          vector<double> closest_front_speed(3, 0);
+          
+          // Default safety distance (will be adjusted with speed)
+          double dynamic_safe_distance = std::max(SAFE_DISTANCE, car_speed * 0.447 * 2.0);
+          
+          // Handle track loop
+          for (int i = 0; i < sensor_fusion.size(); i++) {
+            // Extract vehicle data
+            float d = sensor_fusion[i][6];
+            double vx = sensor_fusion[i][3];
+            double vy = sensor_fusion[i][4];
+            double check_speed = sqrt(vx*vx + vy*vy);
+            double check_car_s = sensor_fusion[i][5];
+            
+            // Handle the case where car crosses finish line (s wraps around)
+            if (check_car_s < 100 && car_s > max_s - 100) {
+              check_car_s += max_s;
+            } else if (car_s < 100 && check_car_s > max_s - 100) {
+              check_car_s -= max_s;
+            }
+            
+            // Project vehicle s position into the future
+            check_car_s += (double)prev_size * 0.02 * check_speed;
+            
+            // Determine lane of other vehicle
+            int check_car_lane = -1;
+            if (d > 0 && d < 4) {
+              check_car_lane = 0; // Left lane
+            } else if (d > 4 && d < 8) {
+              check_car_lane = 1; // Middle lane
+            } else if (d > 8 && d < 12) {
+              check_car_lane = 2; // Right lane
+            }
+            
+            // Skip if not in a valid lane
+            if (check_car_lane < 0) continue;
+            
+            // Calculate dynamic safety distance based on speed
+            // Higher speeds require more following distance (2 seconds rule)
+            dynamic_safe_distance = std::max(SAFE_DISTANCE, car_speed * 0.447 * 2.0);
+            
+            // Check if vehicle is ahead or behind
+            if (check_car_s > car_s) {
+              // Vehicle is ahead - check distance and update closest vehicle data
+              double distance_front = check_car_s - car_s;
+              
+              if (distance_front < closest_front[check_car_lane]) {
+                closest_front[check_car_lane] = distance_front;
+                closest_front_speed[check_car_lane] = check_speed;
+              }
+              
+              // Mark lane as unsafe if vehicle is too close ahead
+              if (distance_front < dynamic_safe_distance) {
+                lane_is_safe[check_car_lane] = false;
+                
+                // Flag as too close if vehicle is in our lane
+                if (check_car_lane == lane) {
+                  too_close = true;
+                }
+              }
+            } else {
+              // Vehicle is behind - still need to check safety for lane changes
+              double distance_back = car_s - check_car_s;
+              
+              // If car is approaching from behind at high speed, mark lane as unsafe
+              // Check if it would reach us within 3 seconds
+              double time_to_collision = distance_back / (check_speed > car_speed*0.447 ? (check_speed - car_speed*0.447) : 0.001);
+              if (distance_back < 15 || (distance_back < 50 && time_to_collision < 3.0)) {
+                lane_is_safe[check_car_lane] = false;
+              }
+            }
+          }
+          
+          // Behavior planning - decide what to do
+          if (too_close) {
+            // Need to slow down
+            ref_vel -= MAX_ACC;
+            
+            // Increment stuck counter when we're behind a slower vehicle
+            if (ref_vel < MAX_SPEED - 5) {
+              stuck_counter++;
+            }
+            
+            // If extremely close to the front car, apply emergency braking
+            if (closest_front[lane] < 15) {
+              // Apply heavier braking to avoid collision
+              ref_vel -= MAX_ACC * 2;
+            }
+            
+            // Match speed with front car if we're getting close and can't change lanes
+            if (closest_front[lane] < dynamic_safe_distance && closest_front[lane] > 0) {
+              // If we can't change lanes, try to match the speed of the car in front
+              if ((lane == 0 && !lane_is_safe[1]) || (lane == 2 && !lane_is_safe[1]) || 
+                  (lane == 1 && !lane_is_safe[0] && !lane_is_safe[2])) {
+                // Get target vehicle speed and match it
+                double front_car_speed = closest_front_speed[lane];
+                // Convert from m/s to mph (0.447 conversion factor)
+                double front_car_mph = front_car_speed * 2.24;
+                // Match speed but stay slightly slower to increase gap
+                if (ref_vel > front_car_mph - 1) {
+                  ref_vel = std::max(front_car_mph - 1, ref_vel - MAX_ACC * 2);
+                }
+              }
+            }
+            
+            // Consider changing lanes if not already changing
+            if (!changing_lanes) {
+              // Variables to help decide best lane
+              int best_lane = lane;
+              double best_cost = 999999;
+              
+              // If we've been patient enough, we might take a slightly riskier lane change
+              // Only when we've been stuck behind slow traffic for a while
+              double safety_threshold = stuck_counter > PATIENCE_THRESHOLD ? 0.8 : 1.0;
+              
+              // Check if adjacent lanes are safe for changing
+              for (int l = 0; l < 3; l++) {
+                // Skip current lane and lanes more than 1 away (can't change to lane 0 from lane 2)
+                if (l == lane || abs(l - lane) > 1) continue;
+                
+                // Get the safety buffer we want to enforce
+                double required_front_distance = dynamic_safe_distance * safety_threshold;
+                
+                // When we're desperate (stuck for too long), consider lane even if not perfectly safe
+                bool is_lane_viable = lane_is_safe[l];
+                if (!is_lane_viable && stuck_counter > PATIENCE_THRESHOLD * 2) {
+                  // If we've been stuck for a very long time, check if the lane is at least somewhat viable
+                  is_lane_viable = closest_front[l] > required_front_distance * 0.7;
+                }
+                
+                // Only consider lane if it's safe
+                if (is_lane_viable) {
+                  // Compute cost based on closest vehicle in lane and speed difference
+                  double cost = 0;
+                  
+                  // If there's a vehicle ahead in this lane, add cost proportional to closeness 
+                  if (closest_front[l] < 999999) {
+                    cost += (100.0 / closest_front[l]);
+                    
+                    // Add cost for slower vehicles
+                    double speed_diff = car_speed*0.447 - closest_front_speed[l];
+                    if (speed_diff > 0) {
+                      cost += speed_diff * 10;
+                    }
+                  }
+                  
+                  // Prefer center lane slightly
+                  if (l != 1) {
+                    cost += 10;
+                  }
+                  
+                  // Update best lane if this is better
+                  if (cost < best_cost) {
+                    best_cost = cost;
+                    best_lane = l;
+                  }
+                }
+              }
+              
+              // Change lane if a better lane was found
+              if (best_lane != lane) {
+                target_lane = best_lane;
+                changing_lanes = true;
+                // Reset stuck counter after successful lane change decision
+                stuck_counter = 0;
+              }
+            }
+          } else if (ref_vel < MAX_SPEED) {
+            // No vehicle close ahead, accelerate if below speed limit
+            ref_vel += MAX_ACC;
+            
+            // Reset stuck counter since we're not stuck
+            stuck_counter = 0;
+            
+            // If not in center lane and not changing lanes, consider returning to center
+            if (lane != 1 && !changing_lanes && lane_is_safe[1]) {
+              // Return to center lane if it's safe and has good clearance
+              if (closest_front[1] > 50) {
+                target_lane = 1;
+                changing_lanes = true;
+              }
+            }
+          }
+          
           // Create a list of evenly spaced waypoints 30m apart
           // Interpolate those waypoints later with spline and fill it in with more points
           vector<double> ptsx;
@@ -163,10 +357,13 @@ int main() {
             ptsy.push_back(ref_y);
           }
         
+          // Target lane is where we want to be, which might be different from current lane during transition
+          int planning_lane = changing_lanes ? target_lane : lane;
+        
           // Add evenly 30m spaced points ahead of the starting reference
-          vector<double> next_wp0 = getXY(car_s+30, 2+4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-          vector<double> next_wp1 = getXY(car_s+60, 2+4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-          vector<double> next_wp2 = getXY(car_s+90, 2+4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp0 = getXY(car_s+30, 2+4*planning_lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp1 = getXY(car_s+60, 2+4*planning_lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp2 = getXY(car_s+90, 2+4*planning_lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
           ptsx.push_back(next_wp0[0]);
           ptsx.push_back(next_wp1[0]);
           ptsx.push_back(next_wp2[0]);
@@ -203,12 +400,6 @@ int main() {
           double x_add_on = 0.0; // Related to the transformation (starting at zero)
           // Fill up the rest of path planner after filling it with previous points, will always output 50 points
           for (int i = 1; i <= 50-previous_path_x.size(); i++) {
-            // Reduce speed if too close, add if no longer close
-            if (too_close) {
-              ref_vel -= .224;
-            } else if (ref_vel < 49.5) {
-              ref_vel += .224;
-            }
             double N = (target_dist/(0.02*ref_vel/2.24));
             double x_point = x_add_on + target_x/N;
             double y_point = s(x_point);
