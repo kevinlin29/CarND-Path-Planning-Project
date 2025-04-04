@@ -190,7 +190,7 @@ int main() {
                 closest_front_speed[check_car_lane] = check_speed;
               }
               
-              // Mark lane as unsafe if vehicle is too close ahead
+              // unsafe if vehicle is too close ahead
               if (distance_front < dynamic_safe_distance) {
                 lane_is_safe[check_car_lane] = false;
                 
@@ -200,11 +200,10 @@ int main() {
                 }
               }
             } else {
-              // Vehicle is behind - still need to check safety for lane changes
+              // Vehicle is behind
               double distance_back = car_s - check_car_s;
               
-              // If car is approaching from behind at high speed, mark lane as unsafe
-              // Check if it would reach us within 3 seconds
+              // mark lane as unsafe if car approaching from behind at high speed
               double time_to_collision = distance_back / (check_speed > car_speed*0.447 ? (check_speed - car_speed*0.447) : 0.001);
               if (distance_back < 10 || (distance_back < 50 && time_to_collision < 3.0)) {
                 lane_is_safe[check_car_lane] = false;
@@ -212,87 +211,78 @@ int main() {
             }
           }
           
-          // Behavior planning - decide what to do
           if (too_close) {
-            // Need to slow down
+            // slow down
             ref_vel -= MAX_ACC;
             
-            // Increment stuck counter when we're behind a slower vehicle
+            // increment stuck counter
             if (ref_vel < MAX_SPEED - 5) {
               stuck_counter++;
             }
             
-            // If extremely close to the front car, apply emergency braking
+            // emergency braking
             if (closest_front[lane] < 10) {
-              // Apply heavier braking to avoid collision
               ref_vel -= MAX_ACC * 2;
             }else if (closest_front[lane] < 5) {
               ref_vel -= MAX_ACC * 5;
             }
             
-            // Match speed with front car if we're getting close and can't change lanes
+            // match front car speed
             if (closest_front[lane] < dynamic_safe_distance && closest_front[lane] > 0) {
-              // If we can't change lanes, try to match the speed of the car in front
               if ((lane == 0 && !lane_is_safe[1]) || (lane == 2 && !lane_is_safe[1]) || 
                   (lane == 1 && !lane_is_safe[0] && !lane_is_safe[2])) {
-                // Get target vehicle speed and match it
                 double front_car_speed = closest_front_speed[lane];
-                // Convert from m/s to mph (0.447 conversion factor)
                 double front_car_mph = front_car_speed * 2.24;
-                // Match speed but stay slightly slower to increase gap
                 if (ref_vel > front_car_mph - 1) {
                   ref_vel = std::max(front_car_mph - 1, ref_vel - MAX_ACC * 2);
                 }
               }
             }
             
-            // Consider changing lanes if not already changing
+            // consider lane change
             if (!changing_lanes) {
-              // Variables to help decide best lane
+              // find best lane
               int best_lane = lane;
               double best_cost = 999999;
               
-              // If we've been patient enough, we might take a slightly riskier lane change
-              // Only when we've been stuck behind slow traffic for a while
+              // adjust safety threshold
               double safety_threshold = stuck_counter > PATIENCE_THRESHOLD ? 0.4 : 1.0;
               
-              // Check if adjacent lanes are safe for changing
+              // check adjacent lanes
               for (int l = 0; l < 3; l++) {
-                // Skip current lane and lanes more than 1 away (can't change to lane 0 from lane 2)
+                // skip current and non-adjacent lanes
                 if (l == lane || abs(l - lane) > 1) continue;
                 
-                // Get the safety buffer we want to enforce
+                // check safety buffer
                 double required_front_distance = dynamic_safe_distance * safety_threshold;
                 
-                // When we're desperate (stuck for too long), consider lane even if not perfectly safe
+                // check lane viability
                 bool is_lane_viable = lane_is_safe[l];
                 if (!is_lane_viable && stuck_counter > PATIENCE_THRESHOLD * 2) {
-                  // If we've been stuck for a very long time, check if the lane is at least somewhat viable
                   is_lane_viable = closest_front[l] > required_front_distance * 0.7;
                 }
                 
-                // Only consider lane if it's safe
+                // evaluate lane cost
                 if (is_lane_viable) {
-                  // Compute cost based on closest vehicle in lane and speed difference
                   double cost = 0;
                   
-                  // If there's a vehicle ahead in this lane, add cost proportional to closeness 
+                  // add distance cost
                   if (closest_front[l] < 999999) {
                     cost += (100.0 / closest_front[l]);
                     
-                    // Add cost for slower vehicles
+                    // add speed difference cost
                     double speed_diff = car_speed*0.447 - closest_front_speed[l];
                     if (speed_diff > 0) {
                       cost += speed_diff * 10;
                     }
                   }
                   
-                  // Prefer center lane slightly
+                  // prefer center lane
                   if (l != 1) {
                     cost += 10;
                   }
                   
-                  // Update best lane if this is better
+                  // update best lane
                   if (cost < best_cost) {
                     best_cost = cost;
                     best_lane = l;
@@ -300,11 +290,10 @@ int main() {
                 }
               }
               
-              // Change lane if a better lane was found
+              // execute lane change
               if (best_lane != lane) {
                 target_lane = best_lane;
                 changing_lanes = true;
-                // Reset stuck counter after successful lane change decision
                 stuck_counter = 0;
               }
             }
